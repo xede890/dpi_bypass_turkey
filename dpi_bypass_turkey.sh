@@ -43,7 +43,7 @@ remove_service() {
     systemctl disable dnscrypt-proxy 2>/dev/null || true
 
     # Remove tray components
-    rm -f "$CTL_SCRIPT" "$POLKIT_POLICY" "$TRAY_SCRIPT" "$AUTOSTART_FILE"
+    rm -f "$CTL_SCRIPT" "$POLKIT_POLICY" "$TRAY_SCRIPT" "$AUTOSTART_FILE" /usr/share/applications/dpi-bypass-tray.desktop
 
     # Kill running tray
     pkill -f "dpi-bypass-tray" 2>/dev/null || true
@@ -79,7 +79,7 @@ install_service() {
     apt-get update -qq
     apt-get install -y -qq git build-essential libnetfilter-queue-dev libcap-dev \
         zlib1g-dev libmnl-dev iptables dnscrypt-proxy gir1.2-appindicator3-0.1 \
-        python3 python3-gi > /dev/null
+        python3 python3-gi python3-cairo > /dev/null
 
     # ---- 2. Zapret ----
     echo "[2/8] Zapret indiriliyor..."
@@ -105,7 +105,7 @@ install_service() {
     systemctl disable dnscrypt-proxy.socket 2>/dev/null || true
 
     cat > "$DNSCRYPT_CONF" <<'DNSEOF'
-listen_addresses = ['127.0.2.1:53']
+listen_addresses = ['127.0.2.1:5354']
 server_names = ['cloudflare', 'google', 'quad9-dnscrypt-ip4-filter-pri']
 ipv4_servers = true
 ipv6_servers = false
@@ -143,7 +143,7 @@ DNSEOF
     mkdir -p /etc/systemd/resolved.conf.d
     cat > "$RESOLVED_OVERRIDE" <<'RESEOF'
 [Resolve]
-DNS=127.0.2.1
+DNS=127.0.2.1:5354
 DNSStubListener=yes
 Domains=~.
 RESEOF
@@ -228,10 +228,13 @@ POLEOF
 
     cat > "$TRAY_SCRIPT" <<'TRAYEOF'
 #!/usr/bin/env python3
-"""System tray indicator for Turkiye DPI Bypass"""
+"""System tray indicator for Turkiye DPI Bypass - iOS toggle style icon"""
 
 import gi
 import subprocess
+import os
+import cairo
+import math
 
 gi.require_version('Gtk', '3.0')
 gi.require_version('AppIndicator3', '0.1')
@@ -241,10 +244,74 @@ SERVICE_ZAPRET = "zapret-turkey"
 SERVICE_DNS = "dnscrypt-proxy"
 APP_ID = "dpi-bypass-turkey"
 
+ICON_DIR = os.path.join(os.path.expanduser("~"), ".local", "share", "icons", "dpi-bypass")
+
+
+def create_toggle_icon(active, partial=False):
+    """Create an iOS-style toggle switch icon as PNG using absolute paths."""
+    os.makedirs(ICON_DIR, exist_ok=True)
+
+    size = 48
+    width, height = size * 2, size
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+    ctx = cairo.Context(surface)
+
+    radius = height / 2.0
+
+    # Pill-shaped background
+    ctx.new_path()
+    ctx.arc(radius, radius, radius, math.pi * 0.5, math.pi * 1.5)
+    ctx.arc(width - radius, radius, radius, math.pi * 1.5, math.pi * 0.5)
+    ctx.close_path()
+
+    if active:
+        # iOS green #34C759
+        ctx.set_source_rgb(0.204, 0.780, 0.349)
+    elif partial:
+        # iOS orange #FF9500
+        ctx.set_source_rgb(1.0, 0.584, 0.0)
+    else:
+        # iOS off-gray #787880 (visible on both light/dark panels)
+        ctx.set_source_rgb(0.47, 0.47, 0.50)
+
+    ctx.fill()
+
+    # Circular knob
+    knob_radius = radius - 3.0
+    knob_x = (width - radius) if active else radius
+
+    # Shadow
+    ctx.arc(knob_x, radius + 1, knob_radius, 0, math.pi * 2)
+    ctx.set_source_rgba(0, 0, 0, 0.2)
+    ctx.fill()
+
+    # White knob
+    ctx.arc(knob_x, radius, knob_radius, 0, math.pi * 2)
+    ctx.set_source_rgb(1.0, 1.0, 1.0)
+    ctx.fill()
+
+    if active:
+        name = "dpi-toggle-on"
+    elif partial:
+        name = "dpi-toggle-partial"
+    else:
+        name = "dpi-toggle-off"
+
+    path = os.path.join(ICON_DIR, name + ".png")
+    surface.write_to_png(path)
+    # Return absolute path without .png extension (AppIndicator accepts this)
+    return path[:-4]
+
+
 class DPIBypassIndicator:
     def __init__(self):
+        # Pre-generate all icons and store absolute paths (without .png)
+        self.icon_on = create_toggle_icon(active=True)
+        self.icon_off = create_toggle_icon(active=False)
+        self.icon_partial = create_toggle_icon(active=False, partial=True)
+
         self.indicator = AppIndicator3.Indicator.new(
-            APP_ID, "network-vpn",
+            APP_ID, self.icon_off,
             AppIndicator3.IndicatorCategory.SYSTEM_SERVICES
         )
         self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
@@ -282,17 +349,16 @@ class DPIBypassIndicator:
     def update_status(self):
         zapret_on = self.is_active(SERVICE_ZAPRET)
         dns_on = self.is_active(SERVICE_DNS)
-        if zapret_on and dns_on:
-            self.status_item.set_label("\u2713 DPI Bypass: Aktif")
-            self.indicator.set_icon_full("network-vpn", "DPI Bypass Aktif")
-            self.toggle_item.set_label("Durdur")
-        elif zapret_on or dns_on:
-            self.status_item.set_label("\u26a0 DPI Bypass: Kismi")
-            self.indicator.set_icon_full("network-vpn-acquiring", "DPI Bypass Kismi")
+        if zapret_on:
+            if dns_on:
+                self.status_item.set_label("\u2713 DPI Bypass: Aktif")
+            else:
+                self.status_item.set_label("\u26a0 DPI Bypass: Aktif (DNS yok)")
+            self.indicator.set_icon_full(self.icon_on, "DPI Bypass Aktif")
             self.toggle_item.set_label("Durdur")
         else:
             self.status_item.set_label("\u2717 DPI Bypass: Kapali")
-            self.indicator.set_icon_full("network-vpn-disabled", "DPI Bypass Kapali")
+            self.indicator.set_icon_full(self.icon_off, "DPI Bypass Kapali")
             self.toggle_item.set_label("Baslat")
         return True
 
@@ -322,9 +388,8 @@ if __name__ == "__main__":
 TRAYEOF
     chmod 755 "$TRAY_SCRIPT"
 
-    # Autostart desktop entry
-    mkdir -p "$AUTOSTART_DIR"
-    cat > "$AUTOSTART_FILE" <<'DESKEOF'
+    # Application launcher entry
+    cat > /usr/share/applications/dpi-bypass-tray.desktop <<'DESKEOF'
 [Desktop Entry]
 Type=Application
 Name=DPI Bypass Tray
@@ -333,8 +398,12 @@ Exec=/usr/local/bin/dpi-bypass-tray
 Icon=network-vpn
 Terminal=false
 Categories=Network;
-X-GNOME-Autostart-enabled=true
 DESKEOF
+
+    # Autostart desktop entry
+    mkdir -p "$AUTOSTART_DIR"
+    cp /usr/share/applications/dpi-bypass-tray.desktop "$AUTOSTART_FILE"
+    echo "X-GNOME-Autostart-enabled=true" >> "$AUTOSTART_FILE"
     chown "$REAL_USER":"$REAL_USER" "$AUTOSTART_FILE"
 
     # Launch tray for current user
